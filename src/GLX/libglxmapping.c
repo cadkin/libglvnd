@@ -29,9 +29,11 @@
 #include <dlfcn.h>
 #include <string.h>
 
-#if defined(HASH_DEBUG)
-# include <stdio.h>
-#endif
+// Nix GL Dispatch Tweaks
+#include <stdio.h>
+#include <unistd.h>
+#include <elf.h>
+#include <stdbool.h>
 
 #include "libglxcurrent.h"
 #include "libglxmapping.h"
@@ -287,6 +289,287 @@ __GLXextFuncPtr __glXFetchDispatchEntry(__GLXvendorInfo *vendor,
     return addr;
 }
 
+static bool IsNixOS()
+{
+    return (access("/etc/NIXOS", F_OK) == 0);
+}
+
+char *ResolveSoFile(const char *soFileName)
+{
+    const char *envSearchPath = getenv("__GLX_NIX_HOST_SEARCH_PATH");
+
+    char *searchPath;
+    if (envSearchPath == NULL) {
+        // Default search path.
+        searchPath = "/usr/lib/x86_64-linux-gnu/";
+    } else {
+        searchPath = strdup(envSearchPath);
+    }
+
+    char *currentSearchPath = strtok(searchPath, ";");
+
+    char *resolvedSoName = NULL;
+
+    while (currentSearchPath != NULL) {
+        char* testSoName = malloc(strlen(currentSearchPath) + strlen(soFileName) + 2);
+        strcpy(testSoName, currentSearchPath);
+        strcat(testSoName, "/");
+        strcat(testSoName, soFileName);
+
+        //printf("glvnd: ... trying '%s' - ", testSoName);
+        if (access(testSoName, F_OK) == 0) {
+            //printf("exists\n");
+            resolvedSoName = testSoName;
+            break;
+        }
+
+        //printf("failed\n");
+
+        free(testSoName);
+
+        currentSearchPath = strtok(NULL, ";");
+    }
+
+    // Cleanup
+    if (envSearchPath != NULL) {
+        free(searchPath);
+    }
+
+    return resolvedSoName;
+}
+
+static char **AllocateStringArray()
+{
+    char **stringArray = malloc(sizeof(char *));
+    stringArray[0] = NULL;
+
+    return stringArray;
+}
+
+static void FreeStringArray(char **stringArray) {
+    if (stringArray == NULL) {
+        return;
+    }
+
+    for (int i = 0; stringArray[i] != NULL; i++) {
+        free(stringArray[i]);
+    }
+
+    free(stringArray);
+}
+
+static char **AppendToStringArray(char **stringArray, const char *string)
+{
+    int count = 0;
+
+    if (stringArray == NULL) {
+        stringArray = AllocateStringArray();
+    } else {
+        while (stringArray[count] != NULL) {
+            count++;
+        }
+    }
+
+    stringArray = realloc(stringArray, sizeof(char *) * (count + 2));
+
+    stringArray[count]     = strdup(string);
+    stringArray[count + 1] = NULL;
+
+    return stringArray;
+}
+
+static char **GetNeededFromSo(const char *resolvedSoFile)
+{
+    FILE *filePtr = fopen(resolvedSoFile, "rb");
+
+    fseek(filePtr, 0, SEEK_END);
+    size_t fileSize = ftell(filePtr);
+    fseek(filePtr, 0, SEEK_SET);
+
+    uint8_t *elfBuffer = malloc(fileSize + 1);
+    fread(elfBuffer, fileSize, 1, filePtr);
+    fclose(filePtr);
+
+    Elf64_Ehdr *elf_header = (Elf64_Ehdr *)elfBuffer;
+
+    if (
+        elf_header->e_ident[EI_MAG0] != ELFMAG0 ||
+        elf_header->e_ident[EI_MAG1] != ELFMAG1 ||
+        elf_header->e_ident[EI_MAG2] != ELFMAG2 ||
+        elf_header->e_ident[EI_MAG3] != ELFMAG3
+    ) {
+        //printf("glvnd: ... not an elf file\n");
+        goto fail;
+    }
+
+    if (elf_header->e_ident[EI_OSABI] != ELFOSABI_SYSV && elf_header->e_ident[EI_OSABI] != ELFOSABI_LINUX) {
+        //printf("glvnd: ... incompatible ABI: %d\n", elf_header->e_ident[EI_OSABI]);
+        goto fail;
+    }
+
+    if (elf_header->e_machine != EM_X86_64) {
+        //printf("glvnd: ... incompatible machine: %d\n", elf_header->e_machine);
+        goto fail;
+    }
+
+    //printf("glvnd: ... elf ok\n");
+
+    char **neededSo = AllocateStringArray();
+
+    Elf64_Ehdr *elfHeader = (Elf64_Ehdr *)elfBuffer;
+
+    Elf64_Off  sectionHeaderOffset = elfHeader->e_shoff;
+    Elf64_Half sectionHeaderCount  = elfHeader->e_shnum;
+    Elf64_Half sectionHeaderSize   = elfHeader->e_shentsize;
+
+    //printf("glvnd: ... section header offset: %ld\n", sectionHeaderOffset);
+    //printf("glvnd: ... section header count:  %hd\n", sectionHeaderCount);
+    //printf("glvnd: ... section header size:   %hd\n", sectionHeaderSize);
+
+    // TODO: error check headers/counts
+
+    // Get the string table.
+    //Elf64_Shdr* string_table_header = (Elf64_Shdr*)(elf_buffer + section_header_offset +(string_table_index * section_header_size));
+    //if (string_table_header->sh_type != SHT_STRTAB) {
+    //    //printf("... earmarked entry is not a string table");
+    //    goto exit_fail;
+    //}
+
+    ////printf("... string table header @ %p\n", string_table_header);
+    ////printf("... string table offset: %ld\n", string_table_header->sh_offset);
+    ////printf("... string table size:   %lu\n", string_table_header->sh_size);
+
+    for (
+        Elf64_Shdr *currentHeader = (Elf64_Shdr *)(elfBuffer + sectionHeaderOffset);
+        currentHeader < (Elf64_Shdr *)(elfBuffer + sectionHeaderOffset + (sectionHeaderCount * sectionHeaderSize));
+        currentHeader++
+    ) {
+        //printf("glvnd: ... section @ %p - %p\n", currentHeader, currentHeader + 1);
+
+        if (currentHeader->sh_type != SHT_DYNAMIC) {
+            //printf("glvnd: ...... skipping non-.dynamic section\n");
+            continue;
+        }
+
+        if (!(currentHeader->sh_flags & SHF_ALLOC)) {
+            //printf("glvnd: ...... .dynamic section discovered but has incorrect flags, skipping\n");
+            continue;
+        }
+
+        //printf("glvnd: ...... .dynamic section discovered\n");
+
+        Elf64_Off   dynOffset    = currentHeader->sh_offset;
+        Elf64_Xword dynSize      = currentHeader->sh_size;
+        Elf64_Xword dynEntrySize = currentHeader->sh_entsize;
+        Elf64_Xword dynCount     = dynSize / dynEntrySize;
+
+        //printf("glvnd: ...... offset: %ld\n", dynOffset);
+        //printf("glvnd: ...... size: %lu\n", dynSize);
+        //printf("glvnd: ...... entry size: %lu\n", dynEntrySize);
+        //printf("glvnd: ...... count: %lu\n", dynCount);
+
+        char *stringTable = NULL;
+
+        // Find the string table.
+        for (
+            Elf64_Dyn *currentDyn = (Elf64_Dyn *)(elfBuffer + dynOffset);
+            currentDyn < (Elf64_Dyn *)(elfBuffer + dynOffset + (dynCount * dynEntrySize));
+            currentDyn++
+        ) {
+            if (currentDyn->d_tag == DT_STRTAB) {
+                stringTable = (char *)(elfBuffer + currentDyn->d_un.d_ptr);
+                //printf("glvnd: ......... DT_STRTAB vaddr: %lu -> %p\n", currentDyn->d_un.d_ptr, stringTable);
+            }
+        }
+
+        if (stringTable == NULL) {
+            //printf("glvnd: ...... could not discover string table in elf\n");
+            goto fail;
+        }
+
+        // Resolve the names.
+        for (
+            Elf64_Dyn *currentDyn = (Elf64_Dyn *)(elfBuffer + dynOffset);
+            currentDyn < (Elf64_Dyn *)(elfBuffer + dynOffset + (dynCount * dynEntrySize));
+            currentDyn++
+        ) {
+            if (currentDyn->d_tag == DT_NEEDED) {
+                char *soName = stringTable + currentDyn->d_un.d_val;
+                //printf("glvnd: ......... so name: '%s'\n", soName);
+
+                neededSo = AppendToStringArray(neededSo, soName);
+            }
+        }
+    }
+
+    free(elfBuffer);
+    return neededSo;
+
+fail:
+    FreeStringArray(neededSo);
+    free(elfBuffer);
+    return NULL;
+}
+
+bool SoAlreadyLoaded(const char* library) {
+    void* handle = dlopen(library, RTLD_NOLOAD | RTLD_LAZY);
+    if (handle == NULL) {
+        return false;
+    }
+
+    dlclose(handle);
+    return true;
+}
+
+static void *ManualLoadFromHost(const char *soFileName)
+{
+    static int indent = 1;
+
+    char *resolvedSo = ResolveSoFile(soFileName);
+
+    if (resolvedSo == NULL) {
+        return NULL;
+    }
+
+    printf("glvnd:%*sloading '%s'\n", indent, " ", resolvedSo);
+
+    char** neededSo = GetNeededFromSo(resolvedSo);
+
+    if (neededSo == NULL) {
+        printf("glvnd:%*sfailed to parse elf: %s\n", indent, " ", resolvedSo);
+        goto fail;
+    }
+
+    indent += 2;
+
+    for (int i = 0; neededSo[i] != NULL; i++) {
+        if (SoAlreadyLoaded(neededSo[i])) {
+            printf("glvnd:%*sskipping already loaded library: '%s'\n", indent, " ", neededSo[i]);
+            continue;
+        }
+
+        void *nestedHandle = ManualLoadFromHost(neededSo[i]);
+
+        if (nestedHandle == NULL) {
+            goto fail;
+        }
+    }
+
+    indent -= 2;
+
+    void *dlHandle = dlopen(resolvedSo, RTLD_LAZY);
+
+    FreeStringArray(neededSo);
+    free(resolvedSo);
+
+    return dlHandle;
+
+fail:
+    FreeStringArray(neededSo);
+    free(resolvedSo);
+    return NULL;
+}
+
 static char *ConstructVendorLibraryFilename(const char *vendorName)
 {
     char *filename;
@@ -425,7 +708,16 @@ __GLXvendorInfo *__glXLookupVendorByName(const char *vendorName)
 
             filename = ConstructVendorLibraryFilename(vendorName);
             if (filename) {
-                vendor->dlhandle = dlopen(filename, RTLD_LAZY);
+                if (IsNixOS()) {
+                    vendor->dlhandle = dlopen(filename, RTLD_LAZY);
+                } else {
+                    vendor->dlhandle = ManualLoadFromHost(filename);
+
+                    if (vendor->dlhandle == NULL) {
+                        printf("glvnd: fallback to raw dlopen() - will likely fail to initalize GLX properly\n");
+                        vendor->dlhandle = dlopen(filename, RTLD_LAZY);
+                    }
+                }
             }
             free(filename);
             if (vendor->dlhandle == NULL) {
